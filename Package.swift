@@ -4,14 +4,15 @@ import PackageDescription
 
 let package = Package(
     name: "gitignore",
+    platforms: [.macOS(.v13)],
     products: [
-        .library(
-            name: "GitIgnoreCLI",
+        .executable(
+            name: "gitignore",
             targets: ["GitIgnoreCLI"]
         )
     ],
     targets: [
-        .target(name: "GitIgnoreCLI")
+        .executableTarget(name: "GitIgnoreCLI")
     ],
     swiftLanguageModes: [.v6],
 )
