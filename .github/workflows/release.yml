@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BINARY_NAME: gitignore
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: macos-26
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      asset: ${{ steps.package.outputs.asset }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode matching .swift-version
+        run: |
+          required="$(cat .swift-version)"
+          for xcode in $(ls -d /Applications/Xcode_*.app | sort -rV); do
+            if DEVELOPER_DIR="$xcode/Contents/Developer" xcrun swift --version 2>/dev/null | grep -q "Swift version ${required}"; then
+              sudo xcode-select -s "$xcode"
+              echo "Selected $xcode"
+              swift --version
+              exit 0
+            fi
+          done
+          echo "::error::No Xcode with Swift ${required} found on this runner"
+          exit 1
+
+      - name: Build arm64 binary
+        run: swift build -c release --arch arm64
+
+      - name: Package
+        id: package
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          asset="${BINARY_NAME}-${version}-macos-arm64.tar.gz"
+          bin_dir="$(swift build -c release --arch arm64 --show-bin-path)"
+          mkdir -p dist
+          cp "${bin_dir}/${BINARY_NAME}" dist/
+          cp LICENSE dist/
+          lipo -info "dist/${BINARY_NAME}"
+          tar -C dist -czf "${asset}" "${BINARY_NAME}" LICENSE
+          sha256="$(shasum -a 256 "${asset}" | awk '{print $1}')"
+          echo "${sha256}  ${asset}" > "${asset}.sha256"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        run: ./dist/${BINARY_NAME} --help
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.package.outputs.asset }}" \
+            "${{ steps.package.outputs.asset }}.sha256" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+  update-formula:
+    name: Open PR to homebrew-tap
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Get app bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          echo "name=${APP_SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${user_id}+${APP_SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Write formula
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p Formula
+          cat > Formula/gitignore.rb <<EOF
+          class Gitignore < Formula
+            desc "List, search, and generate .gitignore templates"
+            homepage "https://github.com/${REPO}"
+            url "https://github.com/${REPO}/releases/download/#{version}/gitignore-#{version}-macos-arm64.tar.gz"
+            version "${VERSION}"
+            sha256 "${SHA256}"
+            license "MIT"
+
+            depends_on :macos
+            depends_on arch: :arm64
+            depends_on macos: :tahoe # Package.swift の .macOS(.v26) に合わせる
+
+            def install
+              bin.install "gitignore"
+            end
+
+            test do
+              assert_match "gitignore", shell_output("#{bin}/gitignore --help")
+            end
+          end
+          EOF
+          cat Formula/gitignore.rb
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          branch="gitignore-${VERSION}"
+          git config user.name "${{ steps.bot.outputs.name }}"
+          git config user.email "${{ steps.bot.outputs.email }}"
+          git switch -c "${branch}"
+          git add Formula/gitignore.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+          git commit -m "gitignore ${VERSION}"
+          git push --force origin "${branch}"
+          if gh pr view "${branch}" >/dev/null 2>&1; then
+            echo "PR already exists"
+          else
+            gh pr create \
+              --title "gitignore ${VERSION}" \
+              --body "Update gitignore to [${VERSION}](https://github.com/${{ github.repository }}/releases/tag/${VERSION})." \
+              --head "${branch}"
+          fi
