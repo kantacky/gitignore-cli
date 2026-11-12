@@ -1,48 +1,75 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
   BINARY_NAME: gitignore
 
 jobs:
+  tag:
+    name: Create tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Validate input
+        id: validate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Run this workflow from the main branch"
+            exit 1
+          fi
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be MAJOR.MINOR.PATCH (got: ${VERSION})"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${VERSION}" \
+            -f sha="${GITHUB_SHA}"
+          echo "Created tag ${VERSION} at ${GITHUB_SHA}"
+
   build:
     name: Build and release
+    needs: tag
     runs-on: macos-26
     outputs:
-      version: ${{ steps.meta.outputs.version }}
       sha256: ${{ steps.package.outputs.sha256 }}
       asset: ${{ steps.package.outputs.asset }}
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Resolve version
-        id: meta
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Select Xcode matching .swift-version
-        run: |
-          required="$(cat .swift-version)"
-          for xcode in $(ls -d /Applications/Xcode_*.app | sort -rV); do
-            if DEVELOPER_DIR="$xcode/Contents/Developer" xcrun swift --version 2>/dev/null | grep -q "Swift version ${required}"; then
-              sudo xcode-select -s "$xcode"
-              echo "Selected $xcode"
-              swift --version
-              exit 0
-            fi
-          done
-          echo "::error::No Xcode with Swift ${required} found on this runner"
-          exit 1
+      - name: Set up Swift
+        uses: kantacky/setup-swift@swift-version-file
 
       - name: Build arm64 binary
         run: swift build -c release --arch arm64
@@ -50,13 +77,12 @@ jobs:
       - name: Package
         id: package
         run: |
-          version="${{ steps.meta.outputs.version }}"
-          asset="${BINARY_NAME}-${version}-macos-arm64.tar.gz"
+          asset="${BINARY_NAME}-${VERSION}-macos-arm64.tar.gz"
           bin_dir="$(swift build -c release --arch arm64 --show-bin-path)"
           mkdir -p dist
           cp "${bin_dir}/${BINARY_NAME}" dist/
           cp LICENSE dist/
-          lipo -info "dist/${BINARY_NAME}"
+          file "dist/${BINARY_NAME}"
           tar -C dist -czf "${asset}" "${BINARY_NAME}" LICENSE
           sha256="$(shasum -a 256 "${asset}" | awk '{print $1}')"
           echo "${sha256}  ${asset}" > "${asset}.sha256"
@@ -69,19 +95,22 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.package.outputs.asset }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            "${{ steps.package.outputs.asset }}" \
-            "${{ steps.package.outputs.asset }}.sha256" \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "${VERSION}" \
+            "${ASSET}" \
+            "${ASSET}.sha256" \
+            --title "${VERSION}" \
             --generate-notes \
             --verify-tag
 
   update-formula:
     name: Open PR to homebrew-tap
-    needs: build
+    needs: [tag, build]
     runs-on: ubuntu-latest
     permissions: {}
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -112,7 +141,6 @@ jobs:
 
       - name: Write formula
         env:
-          VERSION: ${{ needs.build.outputs.version }}
           SHA256: ${{ needs.build.outputs.sha256 }}
           REPO: ${{ github.repository }}
         run: |
@@ -144,7 +172,6 @@ jobs:
       - name: Open pull request
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          VERSION: ${{ needs.build.outputs.version }}
         run: |
           branch="gitignore-${VERSION}"
           git config user.name "${{ steps.bot.outputs.name }}"
@@ -165,3 +192,25 @@ jobs:
               --body "Update gitignore to [${VERSION}](https://github.com/${{ github.repository }}/releases/tag/${VERSION})." \
               --head "${branch}"
           fi
+
+  cleanup:
+    name: Delete release and tag on failure
+    needs: [tag, build, update-formula]
+    if: ${{ always() && needs.tag.result == 'success' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
+    steps:
+      - name: Delete release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release delete "${VERSION}" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes
+            echo "Deleted release ${VERSION}"
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}"
+            echo "Deleted tag ${VERSION}"
+          fi
+          echo "::warning::Release ${VERSION} did not complete; the release and tag were deleted"
