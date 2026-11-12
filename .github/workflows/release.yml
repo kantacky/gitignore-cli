@@ -163,7 +163,7 @@ jobs:
           class Gitignore < Formula
             desc "List, search, and generate .gitignore templates"
             homepage "https://github.com/${REPO}"
-            url "https://github.com/${REPO}/releases/download/#{version}/gitignore-#{version}-macos-arm64.tar.gz"
+            url "https://github.com/${REPO}/releases/download/${VERSION}/gitignore-${VERSION}-macos-arm64.tar.gz"
             version "${VERSION}"
             sha256 "${SHA256}"
             license "MIT"
